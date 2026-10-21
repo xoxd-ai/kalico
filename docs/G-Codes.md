@@ -1043,6 +1043,27 @@ from the config.
 If SAVE_TO_PROFILE is set to 1, the new value will be written to the
 current PID_PROFILE.
 
+### [homing]
+
+The homing module is automatically loaded.
+
+#### MEASURE_AXIS_TRAVEL
+`MEASURE_AXIS_TRAVEL AXIS=<X|Y> [SAMPLES=<count>] [TOLERANCE=<mm>]
+[RETRIES=<count>] [MARGIN=<mm>]`: Measure the full travel of an axis
+that uses sensorless homing. Each sample homes the axis, then runs a
+homing move toward the opposite end with the same virtual endstop and
+reports the distance between both stalls. SAMPLES (default 3) sets how
+many measurements are taken. If they differ by more than TOLERANCE
+(default 1.0mm), the samples are discarded and taken again, up to
+RETRIES (default 3) times. The axis is homed again at the end. The
+result is meant for setting up a new machine: it puts the origin at the
+minimum end (`position_min: 0`), sets `position_max` to the average
+travel minus MARGIN (default 0.5mm), and sets `position_endstop` to
+whichever end the axis homes to. Positions that depend on the axis
+origin (bed mesh, safe_z_home, probe points) must be reviewed after
+the change. Use SAVE_CONFIG to store the new values. The axis must use
+a `virtual_endstop` (or `use_sensorless_homing: True`).
+
 ### [idle_timeout]
 
 The idle_timeout module is automatically loaded.

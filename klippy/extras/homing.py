@@ -414,6 +414,41 @@ class Homing:
                 homepos[axis] = newpos[axis]
             self.toolhead.set_position(homepos)
 
+    def measure_travel(self, rail, axis):
+        # Run a homing move from the homed end to the far end of the axis
+        hi = rail.get_homing_info()
+        pos_min, pos_max = rail.get_range()
+        direction = 1.0 if hi.positive_dir else -1.0
+        far_limit = pos_min if hi.positive_dir else pos_max
+        start = self.toolhead.get_position()
+        # Pretend the toolhead sits past the homed end so that a move longer
+        # than the configured range stays within the axis limits. The caller
+        # must home again to restore the real position.
+        fake_start = far_limit + direction * 1.5 * (pos_max - pos_min)
+        forcepos = list(start)
+        forcepos[axis] = fake_start
+        self.toolhead.set_position(forcepos)
+        movepos = list(start)
+        movepos[axis] = far_limit
+        endstops = rail.get_endstops()
+        hmove = HomingMove(self.printer, endstops)
+        try:
+            self._set_homing_accel(hi.accel, pre_homing=True)
+            self._set_homing_current("xyz"[axis], pre_homing=True)
+            self._reset_endstop_states(endstops)
+            trigpos = hmove.homing_move(movepos, hi.speed, probe_pos=True)
+        finally:
+            self._set_homing_accel(hi.accel, pre_homing=False)
+            self._set_homing_current("xyz"[axis], pre_homing=False)
+        if hmove.check_no_movement() is not None:
+            raise self.printer.command_error(
+                "Endstop %s triggered before moving toward the far end"
+                % (hmove.check_no_movement(),)
+            )
+        return abs(hi.position_endstop - start[axis]) + abs(
+            fake_start - trigpos[axis]
+        )
+
 
 class PrinterHoming:
     def __init__(self, config):
@@ -421,6 +456,11 @@ class PrinterHoming:
         # Register g-code commands
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command("G28", self.cmd_G28)
+        gcode.register_command(
+            "MEASURE_AXIS_TRAVEL",
+            self.cmd_MEASURE_AXIS_TRAVEL,
+            desc=self.cmd_MEASURE_AXIS_TRAVEL_help,
+        )
 
     def manual_home(
         self, toolhead, endstops, pos, speed, triggered, check_triggered
@@ -474,6 +514,96 @@ class PrinterHoming:
                 )
             self.printer.lookup_object("stepper_enable").motor_off()
             raise
+
+    def _measure_travel(self, rail, axis):
+        # Home normally, then stall again at the far end of the axis
+        gcode = self.printer.lookup_object("gcode")
+        gcode.run_script_from_command("G28 %s" % ("XYZ"[axis],))
+        return Homing(self.printer).measure_travel(rail, axis)
+
+    cmd_MEASURE_AXIS_TRAVEL_help = (
+        "Measure the travel of a sensorless axis and update its far limit"
+    )
+
+    def cmd_MEASURE_AXIS_TRAVEL(self, gcmd):
+        axis_name = gcmd.get("AXIS").lower()
+        if axis_name not in ("x", "y"):
+            raise gcmd.error("AXIS must be X or Y")
+        axis = "xyz".index(axis_name)
+        toolhead = self.printer.lookup_object("toolhead")
+        rails = getattr(toolhead.get_kinematics(), "rails", [])
+        rail = rails[axis] if axis < len(rails) else None
+        if rail is None or rail.get_name() != "stepper_" + axis_name:
+            raise gcmd.error(
+                "MEASURE_AXIS_TRAVEL is not supported by this kinematics"
+            )
+        hi = rail.get_homing_info()
+        if not hi.use_sensorless_homing:
+            raise gcmd.error(
+                "MEASURE_AXIS_TRAVEL requires sensorless homing"
+                " (a virtual endstop) on %s" % (rail.get_name(),)
+            )
+        samples = gcmd.get_int("SAMPLES", 3, minval=1)
+        tolerance = gcmd.get_float("TOLERANCE", 1.0, above=0.0)
+        retries = gcmd.get_int("RETRIES", 3, minval=0)
+        margin = gcmd.get_float("MARGIN", 0.5, minval=0.0)
+        travels = []
+        try:
+            while len(travels) < samples:
+                travels.append(self._measure_travel(rail, axis))
+                gcmd.respond_info(
+                    "%s travel: %.3f" % (rail.get_name(), travels[-1])
+                )
+                if max(travels) - min(travels) <= tolerance:
+                    continue
+                if not retries:
+                    raise gcmd.error(
+                        "Travel spread %.3f exceeds TOLERANCE %.3f, check"
+                        " the sensorless homing tuning"
+                        % (max(travels) - min(travels), tolerance)
+                    )
+                retries -= 1
+                gcmd.respond_info("Spread exceeds tolerance, retrying...")
+                travels = []
+            gcode = self.printer.lookup_object("gcode")
+            gcode.run_script_from_command("G28 %s" % (axis_name.upper(),))
+        except self.printer.command_error:
+            if self.printer.is_shutdown():
+                raise self.printer.command_error(
+                    "Homing failed due to printer shutdown"
+                )
+            self.printer.lookup_object("stepper_enable").motor_off()
+            raise
+        travel = sum(travels) / len(travels)
+        # Put 0 at the minimum end; the margin keeps clear of the far stall
+        position_max = travel - margin
+        position_endstop = position_max if hi.positive_dir else 0.0
+        configfile = self.printer.lookup_object("configfile")
+        for option, value in (
+            ("position_min", 0.0),
+            ("position_endstop", position_endstop),
+            ("position_max", position_max),
+        ):
+            configfile.set(rail.get_name(), option, "%.3f" % (value,))
+        gcmd.respond_info(
+            "%s: travel %.3f (min %.3f, max %.3f)\n"
+            "position_min: 0.000\n"
+            "position_endstop: %.3f\n"
+            "position_max: %.3f (margin %.3f)\n"
+            "This moves the axis origin to the minimum end, so review\n"
+            "positions that depend on it (bed mesh, safe_z_home, probe\n"
+            "points). The SAVE_CONFIG command will update the printer\n"
+            "config file and restart the printer."
+            % (
+                rail.get_name(),
+                travel,
+                min(travels),
+                max(travels),
+                position_endstop,
+                position_max,
+                margin,
+            )
+        )
 
 
 def load_config(config):
