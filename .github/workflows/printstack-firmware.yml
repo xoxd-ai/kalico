@@ -1,0 +1,91 @@
+# printstack: build the SV06 MCU image and check klippy config. Never flashes.
+name: printstack firmware
+
+on:
+  push:
+    branches: [printstack]
+    tags: ["ps/*"]
+  pull_request:
+    branches: [printstack]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Kalico commit sv06-a runs (printstack host/roles/klipper_multi/defaults/main.yml).
+  PIN: a6796621ef8abb905935a5b5c194a523a1d45a48
+  # Flashed 2026-10-19; release ps/v2026.10.00-98-ga679662/0.
+  ROLLBACK_SHA256: 6f1e436e45b3edeb0b60868cc693d44ca0a24d9473282f65faa94d9ffbdc5762
+  ARM_TOOLCHAIN_URL: https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
+  ARM_TOOLCHAIN_SHA256: 597893282ac8c6ab1a4073977f2362990184599643b4c5ee34870a8215783a16
+
+jobs:
+  sv06:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Depth 1 and no tags, so the embedded version is the short SHA, as in
+      # the flashed image (printstack scripts/build-sv06-firmware.sh).
+      - uses: actions/checkout@v4
+        with:
+          path: head
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          path: pin
+          ref: ${{ env.PIN }}
+          fetch-depth: 1
+
+      - name: Install Arm GNU Toolchain 15.2.Rel1
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/arm.tar.xz" "$ARM_TOOLCHAIN_URL"
+          echo "$ARM_TOOLCHAIN_SHA256  $RUNNER_TEMP/arm.tar.xz" | sha256sum -c
+          tar -xJf "$RUNNER_TEMP/arm.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi/bin" >> "$GITHUB_PATH"
+
+      - name: Build pin and compare with the rollback image
+        run: |
+          head/printstack/sv06/build.sh pin artifacts sv06-kalico-pin-${PIN:0:7}
+          echo "$ROLLBACK_SHA256  artifacts/sv06-kalico-pin-${PIN:0:7}.bin" | sha256sum -c
+
+      - name: Build checked-out commit twice
+        run: |
+          sha="$(git -C head rev-parse --short=7 HEAD)"
+          head/printstack/sv06/build.sh head artifacts sv06-kalico-$sha
+          cp artifacts/sv06-kalico-$sha.bin "$RUNNER_TEMP/first.bin"
+          git -C head clean -qfdx
+          head/printstack/sv06/build.sh head "$RUNNER_TEMP/second" second
+          cmp "$RUNNER_TEMP/first.bin" "$RUNNER_TEMP/second/second.bin"
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: klippy config check (batch mode, no printer)
+        working-directory: head
+        run: |
+          python -m pip install -q -r scripts/klippy-requirements.txt
+          # The sample config has a [display], whose menu loads
+          # virtual_sdcard, which needs a path; add one in a wrapper.
+          mkdir -p "$RUNNER_TEMP/gcodes"
+          printf '[include %s]\n\n[virtual_sdcard]\npath: %s\n' \
+            "$PWD/config/printer-sovol-sv06-2022.cfg" "$RUNNER_TEMP/gcodes" \
+            > "$RUNNER_TEMP/sv06-check.cfg"
+          python -m klippy "$RUNNER_TEMP/sv06-check.cfg" \
+            -i test/klippy/move.gcode -o /dev/null -v \
+            -d ../artifacts/sv06-kalico-$SHA.dict -l ../artifacts/klippy-check.log
+          tail -5 ../artifacts/klippy-check.log
+
+      - name: SHA256SUMS
+        if: always()
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sv06-firmware-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
