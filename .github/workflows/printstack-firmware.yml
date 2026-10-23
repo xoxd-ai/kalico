@@ -67,7 +67,13 @@ jobs:
         working-directory: head
         run: |
           python -m pip install -q -r scripts/klippy-requirements.txt
-          python -m klippy config/printer-sovol-sv06-2022.cfg \
+          # The sample config has a [display], whose menu loads
+          # virtual_sdcard, which needs a path; add one in a wrapper.
+          mkdir -p "$RUNNER_TEMP/gcodes"
+          printf '[include %s]\n\n[virtual_sdcard]\npath: %s\n' \
+            "$PWD/config/printer-sovol-sv06-2022.cfg" "$RUNNER_TEMP/gcodes" \
+            > "$RUNNER_TEMP/sv06-check.cfg"
+          python -m klippy "$RUNNER_TEMP/sv06-check.cfg" \
             -i test/klippy/move.gcode -o /dev/null -v \
             -d ../artifacts/sv06-kalico-$SHA.dict -l ../artifacts/klippy-check.log
           tail -5 ../artifacts/klippy-check.log
